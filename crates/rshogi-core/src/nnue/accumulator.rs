@@ -773,6 +773,8 @@ pub struct DirtyPiece {
     pub dirty_num: u8,
     /// 玉が動いたかどうか [Color]
     pub king_moved: [bool; Color::NUM],
+    /// 局面側に保持したEffectBucket4差分の識別子。0は記録なし。
+    pub(crate) effect_token: u64,
 }
 
 impl DirtyPiece {
@@ -784,6 +786,7 @@ impl DirtyPiece {
             changed_piece: [ChangedBonaPiece::EMPTY; 2],
             dirty_num: 0,
             king_moved: [false; Color::NUM],
+            effect_token: 0,
         }
     }
 
@@ -792,6 +795,7 @@ impl DirtyPiece {
     pub fn clear(&mut self) {
         self.dirty_num = 0;
         self.king_moved = [false; Color::NUM];
+        self.effect_token = 0;
     }
 }
 

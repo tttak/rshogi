@@ -30,18 +30,50 @@ const ROOK_DIR: u8 = (1u8 << Direct::R as u8)
 #[derive(Clone, PartialEq, Eq)]
 pub struct BoardEffects {
     counts: [[u8; Square::NUM]; Color::NUM],
+    nonzero: [Bitboard; Color::NUM],
+    track_nonzero: bool,
 }
 
 impl BoardEffects {
     pub(crate) fn new() -> Self {
         BoardEffects {
             counts: [[0u8; Square::NUM]; Color::NUM],
+            nonzero: [Bitboard::EMPTY; Color::NUM],
+            track_nonzero: false,
         }
     }
 
     #[inline]
     pub(crate) fn effect(&self, color: Color, sq: Square) -> u8 {
         self.counts[color.index()][sq.index()]
+    }
+
+    /// 両色の「利きが1本以上ある升」。4分類の変更検出に使う。
+    #[inline]
+    pub(crate) fn nonzero(&self) -> [Bitboard; Color::NUM] {
+        self.nonzero
+    }
+
+    /// 4分類を使う局面だけ利き有無のキャッシュを維持する。
+    pub(crate) fn set_track_nonzero(&mut self, enabled: bool) {
+        if self.track_nonzero == enabled {
+            return;
+        }
+        self.track_nonzero = enabled;
+        self.nonzero = [Bitboard::EMPTY; Color::NUM];
+        if enabled {
+            for color in [Color::Black, Color::White] {
+                for sq in Square::all() {
+                    if self.effect(color, sq) != 0 {
+                        self.nonzero[color.index()].set(sq);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn tracks_nonzero(&self) -> bool {
+        self.track_nonzero
     }
 
     fn add_delta(&mut self, color: Color, sq: Square, delta: i8) {
@@ -55,6 +87,9 @@ impl BoardEffects {
         );
         // 利き数は最大でも片側20枚分でu8に収まる前提のため、リリースではキャストのみ。
         self.counts[color.index()][sq.index()] = next as u8;
+        if self.track_nonzero && (current == 0) != (next == 0) {
+            self.nonzero[color.index()].toggle(sq);
+        }
     }
 
     fn apply_bitboard(&mut self, color: Color, bb: Bitboard, delta: i8) {

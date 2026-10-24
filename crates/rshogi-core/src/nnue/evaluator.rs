@@ -16,6 +16,7 @@
 //! // configure_layer_stack_routing(...) で検証する。HalfKX 系では不要。
 //!
 //! // 評価器を作成（局面を指定して初期化）
+//! network.prepare_position(&mut position); // ローカルモデルの4分類記録を設定
 //! let mut evaluator = NNUEEvaluator::new_with_position(network, &position);
 //!
 //! // 評価
@@ -75,6 +76,8 @@ impl NNUEEvaluator {
     /// 局面を指定して評価器を作成
     ///
     /// 内部で `reset()` を呼び出すため、即座に `evaluate()` 可能。
+    /// ローカルモデルで4分類の差分更新を使う場合は、先に
+    /// `net.prepare_position(&mut pos)` を呼ぶ。
     ///
     /// # 例
     ///

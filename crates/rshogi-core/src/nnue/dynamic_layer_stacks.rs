@@ -12,7 +12,7 @@ use super::constants::{
     NNUE_VERSION_HALFKA, NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
 };
 use super::dynamic_halfkx::{DynamicAffine, require_remaining_bytes};
-use super::effect_bucket_features::append_active_effect_bucket;
+use super::effect_bucket_features::{append_active_effect_bucket, dirty_effect_bucket_indices};
 use super::features::{
     FeatureSet as FeatureSetTrait, HalfKPFeatureSet, HalfKaHmMergedFeatureSet,
     HalfKaHmSplitFeatureSet, HalfKaMergedFeatureSet, HalfKaSplitFeatureSet,
@@ -117,7 +117,9 @@ impl RuntimeLsFeature {
             Self::HalfKaSplit => HalfKaSplitFeatureSet::needs_refresh(dirty, perspective),
             Self::HalfKaMerged => HalfKaMergedFeatureSet::needs_refresh(dirty, perspective),
             Self::HalfKaHmSplit => HalfKaHmSplitFeatureSet::needs_refresh(dirty, perspective),
-            Self::EffectBucket(_) => true,
+            Self::EffectBucket(config) => {
+                config.nb != 4 || dirty.effect_token == 0 || dirty.king_moved[perspective.index()]
+            }
         }
     }
 
@@ -478,6 +480,9 @@ impl DynamicLayerStacksNetwork {
     pub(crate) fn requires_board_effects(&self) -> bool {
         matches!(self.feature, RuntimeLsFeature::EffectBucket(_))
     }
+    pub(crate) fn records_effect_dirty(&self) -> bool {
+        matches!(self.feature, RuntimeLsFeature::EffectBucket(config) if config.nb == 4)
+    }
     pub(crate) fn new_stack(&self) -> DynamicLayerStacksStack {
         DynamicLayerStacksStack::new(self)
     }
@@ -715,7 +720,10 @@ impl DynamicLayerStacksNetwork {
         let current = stack.current;
         let dirty = stack.dirty[current];
         for perspective in [Color::Black, Color::White] {
-            if self.feature.needs_refresh(&dirty, perspective) {
+            if self.feature.needs_refresh(&dirty, perspective)
+                || (matches!(self.feature, RuntimeLsFeature::EffectBucket(_))
+                    && pos.effect_dirty(dirty.effect_token).is_none())
+            {
                 self.refresh_perspective(pos, perspective, stack);
                 continue;
             }
@@ -728,6 +736,19 @@ impl DynamicLayerStacksNetwork {
             let prev = &before[prev_start..prev_start + l1];
             let curr = &mut after[..l1];
             curr.copy_from_slice(prev);
+            if let RuntimeLsFeature::EffectBucket(config) = self.feature {
+                let (removed, added) =
+                    dirty_effect_bucket_indices(pos, &dirty, config, perspective);
+                self.apply_feature_changes(curr, &removed, &added);
+                let prev_psqt_start = ((current - 1) * 2 + p) * self.num_buckets;
+                let curr_psqt_start = (current * 2 + p) * self.num_buckets;
+                let (before, after) = stack.psqt.split_at_mut(curr_psqt_start);
+                let curr = &mut after[..self.num_buckets];
+                curr.copy_from_slice(&before[prev_psqt_start..prev_psqt_start + self.num_buckets]);
+                self.apply_psqt_changes(curr, &removed, &added);
+                self.refresh_threat(pos, perspective, stack);
+                continue;
+            }
             let fast_applied = self.try_apply_dirty_piece_fast(
                 curr,
                 &dirty,
@@ -817,11 +838,11 @@ impl DynamicLayerStacksNetwork {
     }
 
     #[inline]
-    fn apply_feature_changes(
+    fn apply_feature_changes<const N: usize>(
         &self,
         accumulation: &mut [i16],
-        removed: &IndexList<MAX_CHANGED_FEATURES>,
-        added: &IndexList<MAX_CHANGED_FEATURES>,
+        removed: &IndexList<N>,
+        added: &IndexList<N>,
     ) {
         match (removed.len(), added.len()) {
             (1, 1) => {
@@ -933,11 +954,11 @@ impl DynamicLayerStacksNetwork {
     }
 
     #[inline]
-    fn apply_psqt_changes(
+    fn apply_psqt_changes<const N: usize>(
         &self,
         accumulation: &mut [i32],
-        removed: &IndexList<MAX_CHANGED_FEATURES>,
-        added: &IndexList<MAX_CHANGED_FEATURES>,
+        removed: &IndexList<N>,
+        added: &IndexList<N>,
     ) {
         if self.psqt_weights.is_empty() {
             return;
@@ -2023,6 +2044,145 @@ mod tests {
         let mut fresh = second.new_stack();
         second.refresh(&pos, &mut fresh);
         assert_current_accumulators_equal(&reused, &fresh, second.spec.l1);
+    }
+
+    #[test]
+    fn effect_dirty_tracking_is_model_specific_and_invalidated_on_undo() {
+        // 全アーキテクチャ共通の各plyに大きな利き差分を再導入しない。
+        assert!(std::mem::size_of::<DirtyPiece>() <= 32);
+        for feature in [
+            RuntimeLsFeature::HalfKaHmMerged,
+            RuntimeLsFeature::EffectBucket(EffectBucketConfig::KINGFIXED_2X2),
+            RuntimeLsFeature::EffectBucket(EffectBucketConfig::KINGFIXED_3X3),
+        ] {
+            let net = test_network(feature, 8, 4, 3, 1, false, 0);
+            let mut pos = Position::new();
+            pos.set_sfen(SFEN_HIRATE).unwrap();
+            NNUENetwork::DynamicLayerStacks(Arc::new(net)).prepare_position(&mut pos);
+            let mv = Move::from_usi("7g7f").unwrap();
+            let dirty = pos.do_move(mv, pos.gives_check(mv));
+            let is_four =
+                matches!(feature, RuntimeLsFeature::EffectBucket(config) if config.nb == 4);
+            assert_eq!(dirty.effect_token != 0, is_four);
+            assert_eq!(pos.effect_dirty(dirty.effect_token).is_some(), is_four);
+            pos.undo_move(mv);
+            assert!(pos.effect_dirty(dirty.effect_token).is_none());
+            // 同じ手を再び指しても、古いaccumulator側の識別子を再利用しない。
+            let next = pos.do_move(mv, pos.gives_check(mv));
+            if is_four {
+                assert_ne!(dirty.effect_token, next.effect_token);
+                assert!(pos.effect_dirty(next.effect_token).is_some());
+            }
+            pos.do_null_move();
+            assert!(pos.effect_dirty(next.effect_token).is_none());
+            pos.undo_null_move();
+            assert!(pos.effect_dirty(next.effect_token).is_none());
+            if is_four {
+                // 同じ局面を利き特徴なしのローカルモデルへ切り替える。
+                let plain = test_network(RuntimeLsFeature::HalfKaHmMerged, 8, 4, 3, 1, false, 0);
+                NNUENetwork::DynamicLayerStacks(Arc::new(plain)).prepare_position(&mut pos);
+                let mv = Move::from_usi("3c3d").unwrap();
+                let dirty = pos.do_move(mv, pos.gives_check(mv));
+                assert_eq!(dirty.effect_token, 0);
+                assert!(pos.effect_dirty(next.effect_token).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn effect_dirty_record_is_invalidated_by_every_pass_entrypoint() {
+        for entry in 0..3 {
+            let mut pos = Position::new();
+            pos.set_startpos_with_pass_rights(1, 1);
+            pos.set_effect_dirty_tracking(true);
+            let mv = Move::from_usi("7g7f").unwrap();
+            let dirty = pos.do_move(mv, pos.gives_check(mv));
+            assert!(pos.effect_dirty(dirty.effect_token).is_some());
+            let pass_dirty = match entry {
+                0 => pos.do_pass_move(),
+                1 => pos.do_move(Move::PASS, false),
+                _ => pos.do_move_with_missing_kings(Move::PASS),
+            };
+            assert_eq!(pass_dirty.effect_token, 0);
+            assert!(pos.effect_dirty(dirty.effect_token).is_none());
+            pos.undo_move(Move::PASS);
+            assert!(pos.effect_dirty(dirty.effect_token).is_none());
+        }
+    }
+
+    #[test]
+    fn dirty_effect_accumulators_match_full_refresh() {
+        use crate::movegen::{MoveList, generate_legal_all};
+        for config in [
+            EffectBucketConfig::KINGFIXED_2X2,
+            EffectBucketConfig::KINGBUCKETED_2X2,
+        ] {
+            let feature = RuntimeLsFeature::EffectBucket(config);
+            let mut net = test_network(feature, 8, 4, 3, 1, true, 0);
+            net.ft_weights = AlignedBox::new_zeroed(feature.dimensions() * 8).into();
+            for (i, w) in net.ft_weights.make_mut().iter_mut().enumerate() {
+                *w = ((i * 17 + i / 8 * 13) % 251) as i16 - 125;
+            }
+            net.psqt_weights = AlignedBox::new_zeroed(feature.dimensions()).into();
+            for (i, w) in net.psqt_weights.make_mut().iter_mut().enumerate() {
+                *w = (i % 127) as i32 - 63;
+            }
+            for sfen in [
+                SFEN_HIRATE,
+                "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
+                "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/3KG2r1 b GSN2L4Pgs2p 1",
+            ] {
+                let mut pos = Position::new();
+                pos.set_sfen(sfen).unwrap();
+                pos.set_effect_dirty_tracking(net.records_effect_dirty());
+                let mut stack = net.new_stack();
+                net.refresh(&pos, &mut stack);
+                let mut moves = MoveList::new();
+                generate_legal_all(&pos, &mut moves);
+                for &mv in moves.iter() {
+                    let dirty = pos.do_move(mv, pos.gives_check(mv));
+                    assert!(pos.effect_dirty(dirty.effect_token).is_some());
+                    stack.push(dirty);
+                    net.ensure(&pos, &mut stack);
+                    let mut full = net.new_stack();
+                    net.refresh(&pos, &mut full);
+                    assert_current_accumulators_equal(&stack, &full, 8);
+                    let start = stack.current * 2;
+                    assert_eq!(&stack.psqt[start..start + 2], &full.psqt[..2]);
+                    stack.pop();
+                    pos.undo_move(mv);
+                }
+                // 未評価の祖先と巻き戻しを含む長い経路でも、全再計算と一致する。
+                let mut path = Vec::new();
+                let mut seed = 42_u64;
+                for ply in 0..180 {
+                    let mut legal = MoveList::new();
+                    generate_legal_all(&pos, &mut legal);
+                    if legal.is_empty() {
+                        break;
+                    }
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let mv = *legal.iter().nth((seed as usize) % legal.len()).unwrap();
+                    let dirty = pos.do_move(mv, pos.gives_check(mv));
+                    stack.push(dirty);
+                    path.push(mv);
+                    if ply % 4 != 1 {
+                        net.ensure(&pos, &mut stack);
+                        let mut full = net.new_stack();
+                        net.refresh(&pos, &mut full);
+                        assert_current_accumulators_equal(&stack, &full, 8);
+                    }
+                }
+                for mv in path.into_iter().rev() {
+                    stack.pop();
+                    pos.undo_move(mv);
+                    net.ensure(&pos, &mut stack);
+                    let mut full = net.new_stack();
+                    net.refresh(&pos, &mut full);
+                    assert_current_accumulators_equal(&stack, &full, 8);
+                }
+            }
+        }
     }
 
     #[test]

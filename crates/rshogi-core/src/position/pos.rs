@@ -96,6 +96,10 @@ pub struct Position {
     long_effects: LongEffects,
     /// board_effectsが最新かどうか（手動配置時の整合性維持用）
     board_effects_dirty: bool,
+    /// Noneはグローバルモデルに従う。ローカル評価器は明示的に上書きできる。
+    effect_dirty_tracking: Option<bool>,
+    /// 差分本体は局面ごとに1組だけ保持し、accumulatorスタックへコピーしない。
+    effect_dirty: EffectDirty,
 
     // === 合成Bitboard（attackers_to_occ最適化用）===
     /// 金相当の駒（Gold | ProPawn | ProLance | ProKnight | ProSilver）
@@ -128,6 +132,14 @@ pub struct Position {
     // === PieceList (NNUE 高速化) ===
     /// 全40駒の BonaPiece 管理テーブル
     pub(super) piece_list: PieceList,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EffectDirty {
+    pub before: [Bitboard; Color::NUM],
+    pub changed: Bitboard,
+    token: u64,
+    valid: bool,
 }
 
 /// 入玉宣言の点数計算に必要な局面メタデータ。
@@ -253,6 +265,8 @@ impl Position {
             board_effects: BoardEffects::new(),
             long_effects: LongEffects::new(),
             board_effects_dirty: false,
+            effect_dirty_tracking: None,
+            effect_dirty: EffectDirty::default(),
             golds_bb: Bitboard::EMPTY,
             bishop_horse_bb: Bitboard::EMPTY,
             rook_dragon_bb: Bitboard::EMPTY,
@@ -627,8 +641,23 @@ impl Position {
         }
     }
 
+    /// ローカルNNUE評価器のモデルに合わせて4分類の記録を切り替える。
+    pub(crate) fn set_effect_dirty_tracking(&mut self, enabled: bool) {
+        self.effect_dirty_tracking = Some(enabled);
+        self.effect_dirty.valid = false;
+        self.board_effects.set_track_nonzero(enabled);
+    }
+
+    #[cfg(feature = "nnue-runtime-dimensions")]
+    #[inline]
+    pub(crate) fn effect_dirty(&self, token: u64) -> Option<&EffectDirty> {
+        (self.effect_dirty.valid && token != 0 && token == self.effect_dirty.token)
+            .then_some(&self.effect_dirty)
+    }
+
     pub(crate) fn recompute_board_effects(&mut self) {
-        let (effects, long_effects) = compute_board_effects_and_long_effects(self);
+        let (mut effects, long_effects) = compute_board_effects_and_long_effects(self);
+        effects.set_track_nonzero(self.board_effects.tracks_nonzero());
         self.board_effects = effects;
         self.long_effects = long_effects;
         self.board_effects_dirty = false;
@@ -636,7 +665,8 @@ impl Position {
 
     #[cfg(debug_assertions)]
     fn debug_verify_board_effects(&self) {
-        let (expected, expected_long) = compute_board_effects_and_long_effects(self);
+        let (mut expected, expected_long) = compute_board_effects_and_long_effects(self);
+        expected.set_track_nonzero(self.board_effects.tracks_nonzero());
         if expected != self.board_effects {
             for color in [Color::Black, Color::White] {
                 for sq in Square::all() {
@@ -1175,6 +1205,15 @@ impl Position {
             self.board_effects_dirty = true;
         }
 
+        let record_effects = self
+            .effect_dirty_tracking
+            .unwrap_or_else(crate::nnue::nnue_records_effect_dirty);
+        self.board_effects.set_track_nonzero(record_effects);
+        self.effect_dirty.valid = false;
+        if record_effects {
+            self.effect_dirty.before = self.board_effects.nonzero();
+        }
+
         if m.is_drop() {
             let pt = m.drop_piece_type();
             let to = m.to();
@@ -1453,6 +1492,14 @@ impl Position {
             self.debug_verify_board_effects();
         }
 
+        if update_board_effects && record_effects {
+            let after = self.board_effects.nonzero();
+            self.effect_dirty.changed =
+                (self.effect_dirty.before[0] ^ after[0]) | (self.effect_dirty.before[1] ^ after[1]);
+            self.effect_dirty.token = self.effect_dirty.token.wrapping_add(1).max(1);
+            self.effect_dirty.valid = true;
+            dirty_piece.effect_token = self.effect_dirty.token;
+        }
         dirty_piece
     }
 
@@ -1460,6 +1507,7 @@ impl Position {
     ///
     /// PASSの場合は undo_pass_move に委譲する。
     pub fn undo_move(&mut self, m: Move) {
+        self.effect_dirty.valid = false;
         if m.is_pass() {
             return self.undo_pass_move();
         }
@@ -1604,6 +1652,7 @@ impl Position {
     }
 
     pub(crate) fn do_null_move_with_prefetch<P: TtPrefetch>(&mut self, prefetcher: &P) {
+        self.effect_dirty.valid = false;
         // update_repetition_info を呼ばないため、repetition 系フィールドの初期化は
         // partial_clone の zero クリアに依存している。in-place 化する場合は要注意。
         let mut new_state = self.cur_state().partial_clone();
@@ -1629,6 +1678,7 @@ impl Position {
 
     /// null moveを戻す
     pub fn undo_null_move(&mut self) {
+        self.effect_dirty.valid = false;
         self.side_to_move = !self.side_to_move;
         let prev_idx = self.cur_state().previous;
         assert_ne!(prev_idx, StateInfo::NO_PREVIOUS, "No previous state for undo_null_move");
@@ -1646,6 +1696,7 @@ impl Position {
     }
 
     fn do_pass_move_impl<const ALLOW_MISSING_KINGS: bool>(&mut self) -> DirtyPiece {
+        self.effect_dirty.valid = false;
         // release ビルドでも検出
         assert!(self.can_pass(), "Cannot pass: rule disabled, in check, or no pass rights");
 
@@ -1727,6 +1778,7 @@ impl Position {
 
     /// パス手を戻す
     pub fn undo_pass_move(&mut self) {
+        self.effect_dirty.valid = false;
         self.side_to_move = !self.side_to_move;
         self.game_ply -= 1;
 

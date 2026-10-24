@@ -68,6 +68,7 @@ static NETWORK: LazyLock<RwLock<Option<Arc<NNUENetwork>>>> = LazyLock::new(|| Rw
 /// `should_update_board_effects()` 等のホットパスから RwLock::read を回避するため。
 static NNUE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static NNUE_REQUIRES_BOARD_EFFECTS: AtomicBool = AtomicBool::new(false);
+static NNUE_RECORDS_EFFECT_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// FV_SCALE のグローバルオーバーライド設定
 ///
@@ -448,6 +449,22 @@ pub enum NNUENetwork {
 }
 
 impl NNUENetwork {
+    fn records_effect_dirty(&self) -> bool {
+        #[cfg(feature = "nnue-runtime-dimensions")]
+        if let Self::DynamicLayerStacks(net) = self {
+            return net.records_effect_dirty();
+        }
+        false
+    }
+
+    /// ローカル評価器で使う局面の利き差分記録を、このモデルに合わせる。
+    ///
+    /// グローバルにロードしたモデルは自動判定される。ローカルモデルでは
+    /// 局面設定後、探索前に呼ぶ。未設定でも評価は全再計算へ安全にフォールバックする。
+    pub fn prepare_position(&self, pos: &mut Position) {
+        pos.set_effect_dirty_tracking(self.records_effect_dirty());
+    }
+
     fn requires_board_effects(&self) -> bool {
         #[cfg(feature = "nnue-runtime-dimensions")]
         if let Self::DynamicLayerStacks(net) = self {
@@ -1555,6 +1572,7 @@ pub fn init_nnue_with_deltas<P: AsRef<Path>>(
     let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
     let network = Arc::new(network);
     NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
+    NNUE_RECORDS_EFFECT_DIRTY.store(network.records_effect_dirty(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
     crate::eval::changed();
@@ -1575,6 +1593,7 @@ pub fn init_nnue_from_bytes_with_deltas(
     let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
     let network = Arc::new(network);
     NNUE_REQUIRES_BOARD_EFFECTS.store(network.requires_board_effects(), Ordering::Release);
+    NNUE_RECORDS_EFFECT_DIRTY.store(network.records_effect_dirty(), Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
     crate::eval::changed();
@@ -1630,6 +1649,7 @@ pub fn clear_nnue() {
     // 短い窓が生じる。false-negative（ロード済みなのに false に見える瞬間）は安全。
     NNUE_INITIALIZED.store(false, Ordering::Release);
     NNUE_REQUIRES_BOARD_EFFECTS.store(false, Ordering::Release);
+    NNUE_RECORDS_EFFECT_DIRTY.store(false, Ordering::Release);
     *NETWORK.write().expect("NNUE lock poisoned") = None;
 }
 
@@ -1645,6 +1665,11 @@ pub fn is_nnue_initialized() -> bool {
 #[inline]
 pub(crate) fn nnue_requires_board_effects() -> bool {
     NNUE_REQUIRES_BOARD_EFFECTS.load(Ordering::Acquire)
+}
+
+#[inline]
+pub(crate) fn nnue_records_effect_dirty() -> bool {
+    NNUE_RECORDS_EFFECT_DIRTY.load(Ordering::Acquire)
 }
 
 // =============================================================================

@@ -138,7 +138,6 @@ pub use net_delta::{
 };
 #[cfg(feature = "layerstack-arch")]
 pub use network::evaluate_layer_stacks;
-pub(crate) use network::nnue_requires_board_effects;
 pub use network::{
     LayerStackBucketMode, NNUENetwork, NnueFormatInfo, ProgressKpAbsWeights,
     SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, compute_layer_stack_progresskpabs_bucket_index,
@@ -156,6 +155,7 @@ pub use network::{
     set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
     validate_layer_stack_routing_configuration,
 };
+pub(crate) use network::{nnue_records_effect_dirty, nnue_requires_board_effects};
 #[cfg(all(feature = "layerstacks-512x16x32", feature = "ft-halfka_hm_merged"))]
 pub use network_layer_stacks::NetworkLayerStacks512x16x32;
 #[cfg(all(feature = "layerstacks-768x8x32", feature = "ft-halfka_hm_merged"))]

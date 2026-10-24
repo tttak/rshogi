@@ -163,6 +163,75 @@ pub fn append_changed_effect_bucket_indices(
     true
 }
 
+/// do_moveで記録した利き有無から4分類の差分を列挙する。
+/// 玉の移動・記録なし・9分類は呼び出し側で全再計算する。
+#[cfg(feature = "nnue-runtime-dimensions")]
+pub(crate) fn dirty_effect_bucket_indices(
+    pos: &Position,
+    dirty: &DirtyPiece,
+    config: EffectBucketConfig,
+    perspective: Color,
+) -> (IndexList<MAX_ACTIVE_FEATURES>, IndexList<MAX_ACTIVE_FEATURES>) {
+    debug_assert_eq!(config.nb, 4);
+    debug_assert!(!dirty.king_moved[perspective.index()]);
+    let effects = pos.effect_dirty(dirty.effect_token).expect("current move's effect record");
+    let king = pos.king_square(perspective);
+    let kb = king_bucket(king, perspective);
+    let mirror = is_hm_mirror(king, perspective);
+    let mut removed = IndexList::new();
+    let mut added = IndexList::new();
+    let mut remaining = effects.changed;
+    let old_bucket = |bp_fb: BonaPiece, packed| {
+        if !packed_is_bucketed(packed, config.king_bucketed) {
+            return 0;
+        }
+        let sq = decode_board_square_fb(bp_fb).expect("bucketed piece is on board");
+        let color = decode_board_color_fb(bp_fb).expect("board piece has color");
+        2 * usize::from(effects.before[color.index()].contains(sq))
+            + usize::from(effects.before[(!color).index()].contains(sq))
+    };
+    for cp in dirty.changed_piece.iter().take(dirty.dirty_num as usize) {
+        if let Some(sq) = decode_board_square_fb(cp.new_piece.fb) {
+            remaining.clear(sq);
+        }
+        let (old, new) = if perspective == Color::Black {
+            (cp.old_piece.fb, cp.new_piece.fb)
+        } else {
+            (cp.old_piece.fw, cp.new_piece.fw)
+        };
+        if old != BonaPiece::ZERO {
+            let packed = pack_bonapiece(old, mirror);
+            let _ = removed.push(effect_bucket_index(
+                halfka_index(kb, packed),
+                old_bucket(cp.old_piece.fb, packed),
+                4,
+            ));
+        }
+        if new != BonaPiece::ZERO {
+            let packed = pack_bonapiece(new, mirror);
+            let bucket = bucket_for_bonapiece_after(pos, cp.new_piece.fb, packed, config);
+            let _ = added.push(effect_bucket_index(halfka_index(kb, packed), bucket, 4));
+        }
+    }
+    for sq in (remaining & pos.occupied()).iter() {
+        let bp = bonapiece_at_square(pos, perspective, sq).expect("occupied square has piece slot");
+        let packed = pack_bonapiece(bp, mirror);
+        if !packed_is_bucketed(packed, config.king_bucketed) {
+            continue;
+        }
+        let color = pos.piece_on(sq).color();
+        let before = 2 * usize::from(effects.before[color.index()].contains(sq))
+            + usize::from(effects.before[(!color).index()].contains(sq));
+        let after = effect_bucket(pos.board_effect(!color, sq), pos.board_effect(color, sq), 4);
+        if before != after {
+            let base = halfka_index(kb, packed);
+            let _ = removed.push(effect_bucket_index(base, before, 4));
+            let _ = added.push(effect_bucket_index(base, after, 4));
+        }
+    }
+    (removed, added)
+}
+
 fn bucket_for_bonapiece_before(
     bp_fb: BonaPiece,
     packed: usize,
